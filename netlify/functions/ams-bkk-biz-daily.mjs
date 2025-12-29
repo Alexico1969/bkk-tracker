@@ -1,301 +1,250 @@
-// netlify/functions/bkk-tracker.mjs
+// netlify/functions/ams-bkk-biz-daily.mjs
 
+const BASE_DEP = "2026-07-23";
+const BASE_RET = "2026-08-11";
+const FLEX_DAYS = 1; // +/- 1 day => 9 pairs
 const ORIGIN = "AMS";
 const DEST = "BKK";
+const CURRENCY = "USD";
+const ADULTS = 1;
 
-// Base dates you gave:
-const BASE_DEPARTURE = "2026-07-23";
-const BASE_RETURN = "2026-08-11";
+const MAX_STOPS = 1; // nonstop or one-stop
+const MAX_HOURS_PER_DIRECTION = 20;
+const MAX_MINUTES = MAX_HOURS_PER_DIRECTION * 60;
 
-// Constraints you gave:
-const MAX_STOPS = 1;          // direct or one-stop
-const MAX_HOURS = 20;         // per-direction itinerary duration must be < 20h
-const ADULTS = 1;             // change if needed
-const CURRENCY = "USD";       // change if you prefer EUR
+const AMADEUS_HOST = () => {
+  const env = (process.env.AMADEUS_ENV || "test").toLowerCase();
+  return env === "prod"
+    ? "https://api.amadeus.com"
+    : "https://test.api.amadeus.com";
+};
 
-function assertEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+// --- Token cache across warm invocations ---
+let cachedToken = null;
+let cachedTokenExp = 0;
+
+function addDays(yyyy_mm_dd, delta) {
+  const d = new Date(`${yyyy_mm_dd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + delta);
+  return d.toISOString().slice(0, 10);
 }
 
-function addDays(yyyy_mm_dd, deltaDays) {
-  const [y, m, d] = yyyy_mm_dd.split("-").map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + deltaDays);
-  const yy = dt.getUTCFullYear();
-  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(dt.getUTCDate()).padStart(2, "0");
-  return `${yy}-${mm}-${dd}`;
-}
-
-// Parses ISO8601 duration like "PT13H45M" -> minutes
-function isoDurationToMinutes(iso) {
-  // Simple robust parse for PT#H#M
-  const m = /^PT(?:(\d+)H)?(?:(\d+)M)?$/i.exec(iso || "");
+function parseISODurationToMinutes(iso) {
+  // e.g. "PT13H45M"
+  // Minimal parser for PT#H#M
+  const m = /^PT(?:(\d+)H)?(?:(\d+)M)?$/.exec(iso);
   if (!m) return Number.POSITIVE_INFINITY;
   const hours = m[1] ? parseInt(m[1], 10) : 0;
   const mins = m[2] ? parseInt(m[2], 10) : 0;
   return hours * 60 + mins;
 }
 
-function buildDatePairs(baseDep, baseRet) {
-  // ±1 day on each -> 9 pairs
-  const deltas = [-1, 0, 1];
-  const pairs = [];
-  for (const dDep of deltas) {
-    for (const dRet of deltas) {
-      pairs.push({
-        departureDate: addDays(baseDep, dDep),
-        returnDate: addDays(baseRet, dRet),
-        delta: { dep: dDep, ret: dRet },
-      });
-    }
-  }
-  return pairs;
+function stopsForItinerary(itinerary) {
+  // Stops ~= segments - 1
+  const segs = itinerary?.segments?.length || 0;
+  return Math.max(0, segs - 1);
 }
 
-async function fetchAmadeusToken({ env, clientId, clientSecret }) {
-  const base = env === "prod" ? "https://api.amadeus.com" : "https://test.api.amadeus.com";
-  const url = `${base}/v1/security/oauth2/token`;
+function isOfferValid(offer) {
+  const itineraries = offer?.itineraries || [];
+  if (itineraries.length < 2) return false; // round-trip expected
 
+  for (const itin of itineraries) {
+    const durationMin = parseISODurationToMinutes(itin.duration);
+    if (durationMin > MAX_MINUTES) return false;
+
+    const stops = stopsForItinerary(itin);
+    if (stops > MAX_STOPS) return false;
+  }
+  return true;
+}
+
+function offerTotalPriceNumber(offer) {
+  const p = offer?.price?.grandTotal ?? offer?.price?.total;
+  const n = Number(p);
+  return Number.isFinite(n) ? n : Number.POSITIVE_INFINITY;
+}
+
+async function getAccessToken() {
+  const now = Date.now();
+  if (cachedToken && now < cachedTokenExp - 10_000) return cachedToken;
+
+  const clientId = process.env.AMADEUS_CLIENT_ID;
+  const clientSecret = process.env.AMADEUS_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error("Missing AMADEUS_CLIENT_ID / AMADEUS_CLIENT_SECRET env vars");
+  }
+
+  const url = `${AMADEUS_HOST()}/v1/security/oauth2/token`;
   const body = new URLSearchParams({
     grant_type: "client_credentials",
     client_id: clientId,
     client_secret: clientSecret,
   });
 
-  const res = await fetch(url, {
+  const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
   });
 
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Amadeus OAuth failed (${res.status}): ${txt}`);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(`OAuth failed (${resp.status}): ${JSON.stringify(data)}`);
   }
 
-  const data = await res.json();
-  if (!data.access_token) throw new Error("Amadeus OAuth: no access_token returned");
-  return { token: data.access_token, base };
+  cachedToken = data.access_token;
+  cachedTokenExp = now + (data.expires_in || 1200) * 1000;
+  return cachedToken;
 }
 
-async function searchRoundTripOffers({ base, token, departureDate, returnDate }) {
-  const url = new URL(`${base}/v2/shopping/flight-offers`);
-
-  // Amadeus Flight Offers Search params:
-  // - travelClass=BUSINESS
-  // - maxNumberOfConnections=1 (0 or 1 stop)
-  // - currencyCode
-  // - max: keep low-ish for speed
+async function searchOnePair({ departureDate, returnDate }, token) {
+  const url = new URL(`${AMADEUS_HOST()}/v2/shopping/flight-offers`);
   url.searchParams.set("originLocationCode", ORIGIN);
   url.searchParams.set("destinationLocationCode", DEST);
   url.searchParams.set("departureDate", departureDate);
   url.searchParams.set("returnDate", returnDate);
   url.searchParams.set("adults", String(ADULTS));
   url.searchParams.set("travelClass", "BUSINESS");
-  url.searchParams.set("maxNumberOfConnections", String(MAX_STOPS));
   url.searchParams.set("currencyCode", CURRENCY);
   url.searchParams.set("max", "50");
 
-  const res = await fetch(url.toString(), {
+  // ✅ Correct param name for Amadeus Flight Offers Search v2:
+  url.searchParams.set("maxNumberOfStops", String(MAX_STOPS));
+
+  const resp = await fetch(url.toString(), {
     headers: { Authorization: `Bearer ${token}` },
   });
 
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    return { ok: false, status: res.status, errorText: txt, data: null };
+  const text = await resp.text();
+  if (!resp.ok) {
+    return { ok: false, status: resp.status, error: text, cheapestValid: null };
   }
 
-  const data = await res.json();
-  return { ok: true, status: res.status, errorText: null, data };
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return { ok: false, status: 500, error: "Invalid JSON from Amadeus", cheapestValid: null };
+  }
+
+  const offers = Array.isArray(json?.data) ? json.data : [];
+
+  const validOffers = offers.filter(isOfferValid);
+  validOffers.sort((a, b) => offerTotalPriceNumber(a) - offerTotalPriceNumber(b));
+
+  const cheapest = validOffers[0] || null;
+
+  return {
+    ok: true,
+    status: 200,
+    error: null,
+    cheapestValid: cheapest
+      ? {
+          id: cheapest.id,
+          price: {
+            currency: cheapest?.price?.currency || CURRENCY,
+            grandTotal: cheapest?.price?.grandTotal ?? cheapest?.price?.total,
+          },
+          itineraries: cheapest.itineraries,
+          validatingAirlineCodes: cheapest.validatingAirlineCodes,
+          lastTicketingDate: cheapest.lastTicketingDate,
+        }
+      : null,
+  };
 }
 
-function offerPassesFilters(offer) {
-  // For round-trip, Amadeus typically returns 2 itineraries (outbound + inbound).
-  // Enforce duration < 20h for each itinerary.
-  const itineraries = offer?.itineraries;
-  if (!Array.isArray(itineraries) || itineraries.length < 2) return false;
-
-  const maxMinutes = MAX_HOURS * 60;
-
-  for (const it of itineraries) {
-    const mins = isoDurationToMinutes(it.duration);
-    if (!(mins < maxMinutes)) return false;
-  }
-
-  // Stops already limited by maxNumberOfConnections, but we can be extra-safe:
-  // A "stop" ~= segments - 1
-  for (const it of itineraries) {
-    const segs = it?.segments || [];
-    const stops = Math.max(0, segs.length - 1);
-    if (stops > MAX_STOPS) return false;
-  }
-
-  return true;
-}
-
-function pickCheapestValidOffer(amadeusResponseJson) {
-  const offers = amadeusResponseJson?.data;
-  if (!Array.isArray(offers) || offers.length === 0) return null;
-
-  let best = null;
-  let bestPrice = Number.POSITIVE_INFINITY;
-
-  for (const offer of offers) {
-    if (!offerPassesFilters(offer)) continue;
-
-    const p = Number(offer?.price?.grandTotal);
-    if (!Number.isFinite(p)) continue;
-
-    if (p < bestPrice) {
-      bestPrice = p;
-      best = offer;
+function buildDatePairs() {
+  const pairs = [];
+  for (let depDelta = -FLEX_DAYS; depDelta <= FLEX_DAYS; depDelta++) {
+    for (let retDelta = -FLEX_DAYS; retDelta <= FLEX_DAYS; retDelta++) {
+      pairs.push({
+        departureDate: addDays(BASE_DEP, depDelta),
+        returnDate: addDays(BASE_RET, retDelta),
+        delta: { dep: depDelta, ret: retDelta },
+      });
     }
   }
-
-  return best;
+  return pairs;
 }
 
-// Simple concurrency limiter (keeps you from timing out)
-async function runWithConcurrency(items, limit, worker) {
-  const results = [];
+// Simple concurrency limiter (keeps Netlify from timing out as easily)
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
   let i = 0;
 
-  async function next() {
+  async function worker() {
     while (i < items.length) {
       const idx = i++;
-      results[idx] = await worker(items[idx], idx);
+      results[idx] = await fn(items[idx], idx);
     }
   }
 
-  const runners = Array.from({ length: Math.min(limit, items.length) }, () => next());
-  await Promise.all(runners);
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  await Promise.all(workers);
   return results;
 }
 
 export const handler = async () => {
+  const started = Date.now();
   try {
-    const clientId = assertEnv("AMADEUS_CLIENT_ID");
-    const clientSecret = assertEnv("AMADEUS_CLIENT_SECRET");
-    const env = (process.env.AMADEUS_ENV || "test").toLowerCase();
+    const token = await getAccessToken();
+    const pairs = buildDatePairs();
 
-    const { token, base } = await fetchAmadeusToken({ env, clientId, clientSecret });
-
-    const pairs = buildDatePairs(BASE_DEPARTURE, BASE_RETURN);
-
-    // 9 searches; do 3 at a time to avoid a 30s timeout.
-    const searches = await runWithConcurrency(pairs, 3, async (pair) => {
-      const resp = await searchRoundTripOffers({
-        base,
-        token,
-        departureDate: pair.departureDate,
-        returnDate: pair.returnDate,
-      });
-
-      if (!resp.ok) {
-        return {
-          pair,
-          ok: false,
-          status: resp.status,
-          error: resp.errorText?.slice(0, 500) || "Unknown error",
-          cheapestValid: null,
-        };
-      }
-
-      const cheapest = pickCheapestValidOffer(resp.data);
-      const cheapestPrice = cheapest ? Number(cheapest.price.grandTotal) : null;
-
+    // 9 searches; do them with concurrency 3 to reduce timeout risk
+    const searches = await mapLimit(pairs, 3, async (p) => {
+      const r = await searchOnePair(p, token);
       return {
-        pair,
-        ok: true,
-        status: resp.status,
-        offersReturned: Array.isArray(resp.data?.data) ? resp.data.data.length : 0,
-        cheapestValid: cheapest
-          ? {
-              price: cheapestPrice,
-              currency: cheapest.price.currency,
-              outboundDuration: cheapest.itineraries?.[0]?.duration,
-              inboundDuration: cheapest.itineraries?.[1]?.duration,
-              // Keep only the essentials so response stays small:
-              validatingAirlineCodes: cheapest.validatingAirlineCodes,
-              id: cheapest.id,
-            }
-          : null,
-        // If you want the raw offer, uncomment this (response may get big):
-        // rawCheapestOffer: cheapest || null,
+        pair: {
+          departureDate: p.departureDate,
+          returnDate: p.returnDate,
+          delta: p.delta,
+        },
+        ...r,
       };
     });
 
-    // Pick the cheapest valid across all 9 date pairs
-    let bestAcrossAll = null;
-    let bestPrice = Number.POSITIVE_INFINITY;
+    // Find overall best across the 9 searches
+    const allCheapest = searches
+      .map((s) => s.cheapestValid)
+      .filter(Boolean);
 
-    for (const s of searches) {
-      if (!s.ok || !s.cheapestValid) continue;
-      const p = Number(s.cheapestValid.price);
-      if (Number.isFinite(p) && p < bestPrice) {
-        bestPrice = p;
-        bestAcrossAll = {
-          departureDate: s.pair.departureDate,
-          returnDate: s.pair.returnDate,
-          price: s.cheapestValid.price,
-          currency: s.cheapestValid.currency,
-          outboundDuration: s.cheapestValid.outboundDuration,
-          inboundDuration: s.cheapestValid.inboundDuration,
-          validatingAirlineCodes: s.cheapestValid.validatingAirlineCodes,
-          offerId: s.cheapestValid.id,
-        };
-      }
-    }
+    allCheapest.sort((a, b) => Number(a.price.grandTotal) - Number(b.price.grandTotal));
+    const bestOffer = allCheapest[0] || null;
 
-    const output = {
+    const payload = {
       route: { origin: ORIGIN, destination: DEST },
       cabin: "BUSINESS",
       constraints: {
         maxStops: MAX_STOPS,
-        maxHoursPerDirection: MAX_HOURS,
+        maxHoursPerDirection: MAX_HOURS_PER_DIRECTION,
         adults: ADULTS,
         currency: CURRENCY,
-        baseDeparture: BASE_DEPARTURE,
-        baseReturn: BASE_RETURN,
-        flexibilityDays: 1,
+        baseDeparture: BASE_DEP,
+        baseReturn: BASE_RET,
+        flexibilityDays: FLEX_DAYS,
         searches: pairs.length,
       },
-      bestOffer: bestAcrossAll,
-      searches, // includes per-pair result summary
+      bestOffer,
+      searches,
       generatedAt: new Date().toISOString(),
+      runtimeMs: Date.now() - started,
     };
 
     return {
       statusCode: 200,
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "cache-control": "no-store",
-      },
-      body: JSON.stringify(output, null, 2),
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify(payload, null, 2),
     };
   } catch (err) {
     return {
       statusCode: 500,
       headers: { "content-type": "application/json; charset=utf-8" },
       body: JSON.stringify(
-        {
-          error: String(err?.message || err),
-          hint:
-            "Check Netlify env vars AMADEUS_CLIENT_ID / AMADEUS_CLIENT_SECRET / AMADEUS_ENV and ensure the function file exports `handler`.",
-        },
+        { ok: false, error: String(err?.message || err), generatedAt: new Date().toISOString() },
         null,
         2
       ),
     };
   }
 };
-
-// Optional: If you want it to run daily automatically (no external cron needed),
-// uncomment this block. It will run on Netlify's scheduler.
-//
-// export const config = {
-//   schedule: "0 7 * * *", // daily 07:00 UTC (adjust later)
-// };
