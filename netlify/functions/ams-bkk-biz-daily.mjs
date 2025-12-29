@@ -10,6 +10,12 @@ let AMADEUS_TOKEN_EXPIRES_AT_MS = 0;
 // -------------------------
 // Helpers
 // -------------------------
+
+export const config = {
+  schedule: "0 12 * * *" // daily 12:00 UTC
+};
+
+
 const json = (statusCode, obj) => ({
   statusCode,
   headers: {
