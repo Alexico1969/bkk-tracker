@@ -1,169 +1,221 @@
-// netlify/functions/bkk-biz-daily.mjs
-// Node 18+ (Netlify) has global fetch.
+// netlify/functions/ams-bkk-biz-daily.mjs
+// Node 18+ (Netlify) — uses built-in fetch
 
-const ENV = process.env.AMADEUS_ENV || "test";
-const AMADEUS_BASE =
-  ENV === "prod" ? "https://api.amadeus.com" : "https://test.api.amadeus.com";
+// -------------------------
+// OAuth token cache (warm instance)
+// -------------------------
+let AMADEUS_TOKEN = null;
+let AMADEUS_TOKEN_EXPIRES_AT_MS = 0;
 
-const ORIGIN = "AMS";
-const DEST = "BKK";
-const CABIN = "BUSINESS";
-const ADULTS = 1;
-const CURRENCY = "USD";
+// -------------------------
+// Helpers
+// -------------------------
+const json = (statusCode, obj) => ({
+  statusCode,
+  headers: {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  },
+  body: JSON.stringify(obj, null, 2),
+});
 
-const BASE_DEPARTURE = "2026-07-23";
-const BASE_RETURN = "2026-08-11";
-const FLEX_DAYS = 1; // +/- 1 day => 3x3 = 9 searches
-
-const MAX_STOPS = 1;
-const MAX_HOURS_PER_DIRECTION = 20;
-
-// Keep results small to reduce time & bandwidth
-const API_MAX_RESULTS = 30;
-
-// Scheduled daily run (UTC). Change if you want.
-// Example: 11:30 UTC = 6:30 AM New York (usually; DST shifts).
-export const config = {
-  schedule: "30 11 * * *",
-};
-
-function json(statusCode, obj) {
-  return {
-    statusCode,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-    },
-    body: JSON.stringify(obj, null, 2),
-  };
+function envOrThrow(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
 }
 
-function parseISODurationToMinutes(iso) {
-  // Supports formats like "PT13H45M", "PT55M", "PT20H"
-  const m = /^PT(?:(\d+)H)?(?:(\d+)M)?$/i.exec(iso || "");
-  if (!m) return null;
-  const hours = m[1] ? parseInt(m[1], 10) : 0;
-  const mins = m[2] ? parseInt(m[2], 10) : 0;
-  return hours * 60 + mins;
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-function addDays(yyyyMmDd, deltaDays) {
-  const [y, m, d] = yyyyMmDd.split("-").map((x) => parseInt(x, 10));
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + deltaDays);
-  const yy = dt.getUTCFullYear();
-  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(dt.getUTCDate()).padStart(2, "0");
-  return `${yy}-${mm}-${dd}`;
+// Hard per-request timeout
+async function fetchWithTimeout(url, options = {}, timeoutMs = 7500) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
 }
 
-function buildDatePairs(baseDep, baseRet, flexDays) {
-  const pairs = [];
-  for (let depDelta = -flexDays; depDelta <= flexDays; depDelta++) {
-    for (let retDelta = -flexDays; retDelta <= flexDays; retDelta++) {
-      pairs.push({
-        departureDate: addDays(baseDep, depDelta),
-        returnDate: addDays(baseRet, retDelta),
-        delta: { dep: depDelta, ret: retDelta },
-      });
+// Single 429 retry wrapper
+async function fetchWith429Retry(url, options = {}, timeoutMs = 7500) {
+  const res = await fetchWithTimeout(url, options, timeoutMs);
+  if (res.status !== 429) return res;
+
+  // one retry (respect Retry-After if present)
+  const ra = res.headers.get("retry-after");
+  const waitMs = ra ? Math.min(4000, Number(ra) * 1000) : 1200;
+  await sleep(waitMs);
+
+  return fetchWithTimeout(url, options, timeoutMs);
+}
+
+// Concurrency limiter (keeps total runtime down + avoids burst rate limits)
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let idx = 0;
+
+  const workers = Array.from({ length: limit }, async () => {
+    while (idx < items.length) {
+      const cur = idx++;
+      results[cur] = await fn(items[cur], cur);
     }
-  }
-  return pairs;
-}
-
-async function fetchWithRetry(url, options, { retries = 3 } = {}) {
-  let attempt = 0;
-  while (true) {
-    attempt++;
-    const res = await fetch(url, options);
-    if (res.status !== 429 || attempt > retries) return res;
-
-    // Exponential backoff + jitter
-    const waitMs = Math.min(4000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250);
-    await new Promise((r) => setTimeout(r, waitMs));
-  }
-}
-
-async function getAccessToken() {
-  const clientId = process.env.AMADEUS_CLIENT_ID;
-  const clientSecret = process.env.AMADEUS_CLIENT_SECRET;
-  if (!clientId || !clientSecret) {
-    throw new Error("Missing AMADEUS_CLIENT_ID or AMADEUS_CLIENT_SECRET env vars.");
-  }
-
-  const tokenUrl = `${AMADEUS_BASE}/v1/security/oauth2/token`;
-
-  const form = new URLSearchParams();
-  form.set("grant_type", "client_credentials");
-  form.set("client_id", clientId);
-  form.set("client_secret", clientSecret);
-
-  const res = await fetchWithRetry(tokenUrl, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: form.toString(),
   });
 
-  const txt = await res.text();
-  if (!res.ok) {
-    throw new Error(`OAuth failed (${res.status}): ${txt}`);
-  }
-  const data = JSON.parse(txt);
-  return data.access_token;
+  await Promise.all(workers);
+  return results;
 }
 
-function isOfferValid(offer) {
-  // Offer has itineraries: [outbound, inbound] for return trips.
-  const itineraries = offer?.itineraries;
-  if (!Array.isArray(itineraries) || itineraries.length < 2) return false;
+function parseDurationToMinutes(iso) {
+  // "PT15H20M" => 920
+  const m = /^PT(?:(\d+)H)?(?:(\d+)M)?$/.exec(iso || "");
+  if (!m) return null;
+  const h = m[1] ? parseInt(m[1], 10) : 0;
+  const min = m[2] ? parseInt(m[2], 10) : 0;
+  return h * 60 + min;
+}
 
-  for (const itin of itineraries.slice(0, 2)) {
-    const segments = itin?.segments || [];
-    const stops = Math.max(0, segments.length - 1);
-    if (stops > MAX_STOPS) return false;
+function addDays(yyyy_mm_dd, delta) {
+  const d = new Date(`${yyyy_mm_dd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + delta);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
 
-    // Prefer itinerary.duration ISO string
-    const mins = parseISODurationToMinutes(itin?.duration);
-    if (mins == null) return false;
-    if (mins > MAX_HOURS_PER_DIRECTION * 60) return false;
+// -------------------------
+// Amadeus
+// -------------------------
+function amadeusBaseUrl() {
+  // Amadeus uses different hostnames for test vs prod
+  const env = (process.env.AMADEUS_ENV || "test").toLowerCase();
+  return env === "prod"
+    ? "https://api.amadeus.com"
+    : "https://test.api.amadeus.com";
+}
+
+async function getAmadeusToken() {
+  const now = Date.now();
+  if (AMADEUS_TOKEN && now < AMADEUS_TOKEN_EXPIRES_AT_MS - 15_000) {
+    return AMADEUS_TOKEN;
   }
 
-  // Cabin validation: Amadeus returns "travelerPricings" with fareDetailsBySegment
-  // We'll accept the offer if ANY travelerPricing shows CABIN in fareDetailsBySegment
-  const tps = offer?.travelerPricings || [];
-  if (!Array.isArray(tps) || tps.length === 0) return false;
+  const clientId = envOrThrow("AMADEUS_CLIENT_ID");
+  const clientSecret = envOrThrow("AMADEUS_CLIENT_SECRET");
 
-  const cabinOk = tps.some((tp) =>
-    (tp.fareDetailsBySegment || []).every((fds) => (fds.cabin || "").toUpperCase() === CABIN)
+  const url = `${amadeusBaseUrl()}/v1/security/oauth2/token`;
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+  });
+
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+    },
+    7500
   );
-  return cabinOk;
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Amadeus OAuth failed (${res.status}): ${t}`);
+  }
+
+  const data = await res.json();
+  // Typical: { access_token, expires_in }
+  AMADEUS_TOKEN = data.access_token;
+  AMADEUS_TOKEN_EXPIRES_AT_MS = Date.now() + (data.expires_in || 900) * 1000;
+  return AMADEUS_TOKEN;
 }
 
-function offerPriceNumber(offer) {
-  const total = offer?.price?.grandTotal ?? offer?.price?.total;
-  const n = total ? Number(total) : NaN;
-  return Number.isFinite(n) ? n : null;
+async function searchOffersOnePair({
+  origin,
+  destination,
+  departureDate,
+  returnDate,
+  adults,
+  currency,
+  cabin,
+  max = 10, // <- your "max: 10"
+}) {
+  const token = await getAmadeusToken();
+
+  const url = new URL(`${amadeusBaseUrl()}/v2/shopping/flight-offers`);
+  url.searchParams.set("originLocationCode", origin);
+  url.searchParams.set("destinationLocationCode", destination);
+  url.searchParams.set("departureDate", departureDate);
+  url.searchParams.set("returnDate", returnDate);
+  url.searchParams.set("adults", String(adults));
+  url.searchParams.set("currencyCode", currency);
+  url.searchParams.set("travelClass", cabin);
+  url.searchParams.set("nonStop", "false");
+  url.searchParams.set("max", String(max));
+
+  // NOTE:
+  // Amadeus does NOT accept maxNumberOfStops / maxNumberOfConnections on this endpoint.
+  // We filter stops ourselves after getting results.
+
+  const res = await fetchWith429Retry(
+    url.toString(),
+    {
+      method: "GET",
+      headers: { authorization: `Bearer ${token}` },
+    },
+    8000
+  );
+
+  const text = await res.text().catch(() => "");
+  if (!res.ok) {
+    return { ok: false, status: res.status, error: text, data: null };
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return { ok: false, status: 200, error: "Invalid JSON from Amadeus", data: null };
+  }
+
+  return { ok: true, status: 200, error: null, data };
 }
 
+// -------------------------
+// Offer filtering + picking cheapest
+// -------------------------
 function summarizeOffer(offer) {
-  const price = offer?.price?.grandTotal ?? offer?.price?.total ?? null;
-  const currency = offer?.price?.currency ?? CURRENCY;
+  const price = offer?.price?.total;
+  const currency = offer?.price?.currency;
+  const itineraries = (offer?.itineraries || []).map((it) => {
+    const duration = it.duration;
+    const durationMinutes = parseDurationToMinutes(duration);
+    const segs = it.segments || [];
+    const stops = Math.max(0, segs.length - 1);
+    const carriers = Array.from(new Set(segs.map((s) => s.carrierCode).filter(Boolean)));
+    const firstDeparture = segs[0]?.departure?.at || null;
+    const lastArrival = segs[segs.length - 1]?.arrival?.at || null;
 
-  const itineraries = (offer?.itineraries || []).slice(0, 2).map((itin) => {
-    const mins = parseISODurationToMinutes(itin?.duration);
-    const segments = itin?.segments || [];
     return {
-      duration: itin?.duration ?? null,
-      durationMinutes: mins,
-      stops: Math.max(0, segments.length - 1),
-      carriers: Array.from(new Set(segments.map((s) => s?.carrierCode).filter(Boolean))),
-      firstDeparture: segments[0]?.departure?.at ?? null,
-      lastArrival: segments[segments.length - 1]?.arrival?.at ?? null,
+      duration,
+      durationMinutes,
+      stops,
+      carriers,
+      firstDeparture,
+      lastArrival,
     };
   });
 
   return {
-    id: offer?.id ?? null,
+    id: offer?.id,
     price,
     currency,
     itineraries,
@@ -171,126 +223,168 @@ function summarizeOffer(offer) {
   };
 }
 
-async function searchOnePair(token, departureDate, returnDate) {
-  const url = new URL(`${AMADEUS_BASE}/v2/shopping/flight-offers`);
-  url.searchParams.set("originLocationCode", ORIGIN);
-  url.searchParams.set("destinationLocationCode", DEST);
-  url.searchParams.set("departureDate", departureDate);
-  url.searchParams.set("returnDate", returnDate);
-  url.searchParams.set("adults", String(ADULTS));
-  url.searchParams.set("travelClass", CABIN);
-  url.searchParams.set("currencyCode", CURRENCY);
-  url.searchParams.set("max", String(API_MAX_RESULTS));
-  // NOTE: nonStop=true would force direct only. You want direct OR one-stop, so we leave it off.
+function isValidOffer(summary, { maxStops, maxMinutesPerDirection }) {
+  if (!summary?.price) return false;
+  if (!Array.isArray(summary.itineraries) || summary.itineraries.length !== 2) return false;
 
-  const res = await fetchWithRetry(url.toString(), {
-    headers: { authorization: `Bearer ${token}` },
-  });
-
-  const text = await res.text();
-  if (!res.ok) {
-    return { ok: false, status: res.status, error: text, cheapestValid: null };
-    // 400s here usually mean invalid params; 429 means rate limit; 500s are transient.
+  for (const it of summary.itineraries) {
+    if (it.durationMinutes == null) return false;
+    if (it.durationMinutes > maxMinutesPerDirection) return false;
+    if (it.stops > maxStops) return false;
   }
-
-  const data = JSON.parse(text);
-  const offers = Array.isArray(data?.data) ? data.data : [];
-
-  // Filter then pick cheapest
-  const valid = offers.filter(isOfferValid);
-
-  valid.sort((a, b) => {
-    const pa = offerPriceNumber(a) ?? Number.POSITIVE_INFINITY;
-    const pb = offerPriceNumber(b) ?? Number.POSITIVE_INFINITY;
-    return pa - pb;
-  });
-
-  const cheapest = valid[0] || null;
-  return {
-    ok: true,
-    status: 200,
-    error: null,
-    cheapestValid: cheapest ? summarizeOffer(cheapest) : null,
-  };
+  return true;
 }
 
-// Basic concurrency limiter to avoid 429 storms
-async function mapWithConcurrency(items, concurrency, fn) {
-  const results = new Array(items.length);
-  let i = 0;
+function pickCheapestValid(offers, constraints) {
+  const summaries = (offers || []).map(summarizeOffer);
+  const valids = summaries.filter((s) => isValidOffer(s, constraints));
 
-  async function worker() {
-    while (true) {
-      const idx = i++;
-      if (idx >= items.length) return;
-      results[idx] = await fn(items[idx], idx);
+  if (valids.length === 0) return null;
+
+  valids.sort((a, b) => Number(a.price) - Number(b.price));
+  return valids[0];
+}
+
+// -------------------------
+// Google Sheets logging (Apps Script webhook)
+// -------------------------
+async function postToSheetsWebhook(payload) {
+  const url = process.env.SHEETS_WEBHOOK_URL;
+  if (!url) return { ok: false, status: null, error: "No SHEETS_WEBHOOK_URL set" };
+
+  const secret = process.env.SHEETS_SECRET || ""; // optional shared secret
+
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ secret, ...payload }),
+    },
+    6500
+  );
+
+  const text = await res.text().catch(() => "");
+  if (!res.ok) return { ok: false, status: res.status, error: text };
+  return { ok: true, status: res.status, error: null };
+}
+
+// -------------------------
+// Handler
+// -------------------------
+export async function handler() {
+  const origin = "AMS";
+  const destination = "BKK";
+  const cabin = "BUSINESS";
+
+  // Your dates + flexibility
+  const baseDeparture = "2026-07-23";
+  const baseReturn = "2026-08-11";
+  const flexibilityDays = 1; // +/- 1 day => 9 combos
+
+  // Your constraints
+  const constraints = {
+    maxStops: 1, // direct or one-stop
+    maxMinutesPerDirection: 20 * 60, // under 20h each direction
+    adults: 1,
+    currency: "USD",
+  };
+
+  // Build 9 date pairs
+  const deltas = [-1, 0, 1];
+  const pairs = [];
+  for (const depD of deltas) {
+    for (const retD of deltas) {
+      pairs.push({
+        departureDate: addDays(baseDeparture, depD),
+        returnDate: addDays(baseReturn, retD),
+        delta: { dep: depD, ret: retD },
+      });
     }
   }
 
-  const workers = Array.from({ length: concurrency }, () => worker());
-  await Promise.all(workers);
-  return results;
-}
+  const startedAt = Date.now();
 
-export const handler = async () => {
-  const started = Date.now();
+  // Run with limited concurrency (fast but less spiky)
+  const results = await mapLimit(pairs, 3, async (pair) => {
+    const r = await searchOffersOnePair({
+      origin,
+      destination,
+      departureDate: pair.departureDate,
+      returnDate: pair.returnDate,
+      adults: constraints.adults,
+      currency: constraints.currency,
+      cabin,
+      max: 10,
+    });
 
-  const pairs = buildDatePairs(BASE_DEPARTURE, BASE_RETURN, FLEX_DAYS);
-
-  try {
-    const token = await getAccessToken();
-
-    // Concurrency 2 is a safe default to reduce 429 + still finish under timeout.
-    const searches = await mapWithConcurrency(pairs, 2, async (p) => {
-      const r = await searchOnePair(token, p.departureDate, p.returnDate);
+    if (!r.ok) {
       return {
-        pair: {
-          departureDate: p.departureDate,
-          returnDate: p.returnDate,
-          delta: p.delta,
-        },
-        ...r,
+        pair,
+        ok: false,
+        status: r.status,
+        error: r.error,
+        cheapestValid: null,
       };
+    }
+
+    const offers = r.data?.data || [];
+    const cheapestValid = pickCheapestValid(offers, {
+      maxStops: constraints.maxStops,
+      maxMinutesPerDirection: constraints.maxMinutesPerDirection,
     });
 
-    // Find best across searches
-    const candidates = searches
-      .map((s) => s.cheapestValid)
-      .filter(Boolean);
+    return {
+      pair,
+      ok: true,
+      status: 200,
+      error: null,
+      cheapestValid,
+    };
+  });
 
-    candidates.sort((a, b) => {
-      const pa = a?.price ? Number(a.price) : Number.POSITIVE_INFINITY;
-      const pb = b?.price ? Number(b.price) : Number.POSITIVE_INFINITY;
-      return pa - pb;
-    });
-
-    const best = candidates[0] || null;
-
-    return json(200, {
-      route: { origin: ORIGIN, destination: DEST },
-      cabin: CABIN,
-      constraints: {
-        maxStops: MAX_STOPS,
-        maxHoursPerDirection: MAX_HOURS_PER_DIRECTION,
-        adults: ADULTS,
-        currency: CURRENCY,
-        baseDeparture: BASE_DEPARTURE,
-        baseReturn: BASE_RETURN,
-        flexibilityDays: FLEX_DAYS,
-        searches: pairs.length,
-      },
-      bestOffer: best,
-      searches,
-      generatedAt: new Date().toISOString(),
-      runtimeMs: Date.now() - started,
-      env: ENV,
-    });
-  } catch (err) {
-    return json(500, {
-      error: String(err?.message || err),
-      generatedAt: new Date().toISOString(),
-      runtimeMs: Date.now() - started,
-      env: ENV,
-    });
+  // Pick best across all pairs
+  const allCheapest = results.map((x) => x.cheapestValid).filter(Boolean);
+  let bestOffer = null;
+  if (allCheapest.length) {
+    allCheapest.sort((a, b) => Number(a.price) - Number(b.price));
+    bestOffer = allCheapest[0];
   }
-};
+
+  const payload = {
+    route: { origin, destination },
+    cabin,
+    constraints: {
+      maxStops: constraints.maxStops,
+      maxHoursPerDirection: 20,
+      adults: constraints.adults,
+      currency: constraints.currency,
+      baseDeparture,
+      baseReturn,
+      flexibilityDays,
+      searches: pairs.length,
+    },
+    bestOffer,
+    searches: results.map((r) => ({
+      pair: r.pair,
+      ok: r.ok,
+      status: r.status,
+      error: r.error,
+      cheapestValid: r.cheapestValid,
+    })),
+    generatedAt: new Date().toISOString(),
+    runtimeMs: Date.now() - startedAt,
+    env: (process.env.AMADEUS_ENV || "test").toLowerCase(),
+  };
+
+  // Log to Sheets (non-fatal if it fails)
+  const sheetsRes = await postToSheetsWebhook({
+    kind: "ams-bkk-biz-daily",
+    generatedAt: payload.generatedAt,
+    bestOffer: payload.bestOffer,
+    constraints: payload.constraints,
+  });
+  payload.sheetsWrite = sheetsRes;
+
+  return json(200, payload);
+}
