@@ -1,0 +1,24 @@
+1. Return flight from Amsterdam to Bangkok (and back)
+2. Direct flight or one-stop
+3. Total flight time under 20 hours
+4. Business class
+
+
+https://bkk-tracker.netlify.app/.netlify/functions/ams-bkk-biz-daily
+
+https://bkk-tracker.netlify.app/.netlify/functions/test-sheets-post
+https://bkk-tracker.netlify.app/.netlify/functions/test-sheets-push
+
+
+Google Sheets:
+
+Deployment ID:
+AKfycbzlKUP4F22Mvz-XeeFKEZ9aUf4f3PMfgNCPeHwbltbmFX0kyNacPJlePUyGertku_FRFg
+
+Web app URL:
+
+https://script.google.com/macros/s/AKfycbzlKUP4F22Mvz-XeeFKEZ9aUf4f3PMfgNCPeHwbltbmFX0kyNacPJlePUyGertku_FRFg/exec
+
+Web app secret:
+
+SDLKJSOAlkalalkslAL

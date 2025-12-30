@@ -1,0 +1,46 @@
+function doPost(e) {
+  const body = JSON.parse(e.postData.contents || "{}");
+
+  // Optional shared secret check
+  const expected = PropertiesService.getScriptProperties().getProperty("SHEETS_SECRET") || "";
+  if (expected && body.secret !== expected) {
+    return ContentService.createTextOutput("Unauthorized").setMimeType(ContentService.MimeType.TEXT);
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Daily") || ss.insertSheet("Daily");
+
+  const ts = body.generatedAt || new Date().toISOString();
+  const offer = body.bestOffer || null;
+
+  // If no offer, still log a row so you can see failures
+  if (!offer) {
+    sheet.appendRow([ts, "", "", "", "", "", "", "", "", "", ""]);
+    return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
+  }
+
+  // Pick the 2 itineraries
+  const outIt = offer.itineraries?.[0] || {};
+  const inIt  = offer.itineraries?.[1] || {};
+
+  // These dates: derive from firstDeparture
+  const depDate = (outIt.firstDeparture || "").slice(0, 10);
+  const retDate = (inIt.firstDeparture || "").slice(0, 10);
+
+  sheet.appendRow([
+    ts,
+    offer.price,
+    offer.currency,
+    depDate,
+    retDate,
+    outIt.durationMinutes,
+    outIt.stops,
+    (outIt.carriers || []).join(","),
+    inIt.durationMinutes,
+    inIt.stops,
+    (inIt.carriers || []).join(","),
+  ]);
+
+  return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
+}
+

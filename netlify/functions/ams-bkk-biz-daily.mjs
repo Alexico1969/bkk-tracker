@@ -255,8 +255,8 @@ function pickCheapestValid(offers, constraints) {
 // Google Sheets logging (Apps Script webhook)
 // -------------------------
 async function postToSheetsWebhook(payload) {
-  const url = process.env.SHEETS_WEBHOOK_URL;
-  if (!url) return { ok: false, status: null, error: "No SHEETS_WEBHOOK_URL set" };
+  const url = process.env.SHEETS_WEBAPP_URL;
+  if (!url) return { ok: false, status: null, error: "No SHEETS_WEBAPP_URL set" };
 
   const secret = process.env.SHEETS_SECRET || ""; // optional shared secret
 
