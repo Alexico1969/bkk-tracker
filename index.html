@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BKK Tracker — Flight Price Monitor</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #d4af37;
+            --dark-bg: #0f1419;
+            --card-bg: #1a2332;
+            --accent-teal: #06b6d4;
+            --accent-blue: #0369a1;
+            --text-light: #e8eef5;
+            --text-muted: #94a3b8;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #0f1419 0%, #1a2332 50%, #0d2a3d 100%);
+            color: var(--text-light);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 3rem;
+            animation: slideDown 0.8s ease-out;
+        }
+
+        h1 {
+            font-size: 3.5rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--primary), var(--accent-teal));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: 1px;
+        }
+
+        .subtitle {
+            font-size: 1.2rem;
+            color: var(--text-muted);
+            margin-bottom: 1rem;
+        }
+
+        .route-info {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 1rem;
+            margin-top: 1.5rem;
+            flex-wrap: wrap;
+        }
+
+        .route-badge {
+            background: rgba(6, 182, 212, 0.1);
+            border: 1px solid var(--accent-teal);
+            padding: 0.7rem 1.2rem;
+            border-radius: 20px;
+            font-size: 0.95rem;
+            color: var(--accent-teal);
+            font-weight: 500;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 2rem;
+            animation: fadeIn 1s ease-out 0.3s both;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border: 1px solid rgba(212, 175, 55, 0.2);
+            border-radius: 12px;
+            padding: 2rem;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--primary), var(--accent-teal));
+            transform: scaleX(0);
+            transform-origin: left;
+            transition: transform 0.3s ease;
+        }
+
+        .card:hover {
+            border-color: var(--primary);
+            transform: translateY(-8px);
+            box-shadow: 0 20px 40px rgba(212, 175, 55, 0.15);
+        }
+
+        .card:hover::before {
+            transform: scaleX(1);
+        }
+
+        .card-icon {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .card h2 {
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+            color: var(--primary);
+        }
+
+        .card-type {
+            font-size: 0.85rem;
+            color: var(--accent-teal);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 1rem;
+            font-weight: 600;
+        }
+
+        .card p {
+            color: var(--text-muted);
+            line-height: 1.6;
+            margin-bottom: 1.5rem;
+            font-size: 0.95rem;
+        }
+
+        .card a {
+            display: inline-block;
+            background: linear-gradient(135deg, var(--primary), var(--accent-teal));
+            color: var(--dark-bg);
+            padding: 0.8rem 1.6rem;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            word-break: break-all;
+            font-size: 0.9rem;
+        }
+
+        .card a:hover {
+            transform: scale(1.05);
+            box-shadow: 0 10px 20px rgba(212, 175, 55, 0.3);
+        }
+
+        .card-url {
+            margin-top: 1rem;
+            padding-top: 1rem;
+            border-top: 1px solid rgba(212, 175, 55, 0.1);
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            word-break: break-all;
+            font-family: 'Courier New', monospace;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+            }
+            to {
+                opacity: 1;
+            }
+        }
+
+        footer {
+            text-align: center;
+            margin-top: 4rem;
+            padding-top: 2rem;
+            border-top: 1px solid rgba(212, 175, 55, 0.1);
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 2.2rem;
+            }
+
+            .container {
+                grid-template-columns: 1fr;
+            }
+
+            header {
+                margin-bottom: 2rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>✈️ BKK Tracker</h1>
+        <p class="subtitle">Amsterdam to Bangkok Flight Price Monitor</p>
+        <div class="route-info">
+            <span class="route-badge">🇳🇱 Amsterdam (AMS)</span>
+            <span class="route-badge">↔️</span>
+            <span class="route-badge">🇹🇭 Bangkok (BKK)</span>
+            <span class="route-badge">💼 Business Class</span>
+            <span class="route-badge">📊 Daily Updates</span>
+        </div>
+    </header>
+
+    <main class="container">
+        <!-- Daily Scheduled Function -->
+        <div class="card">
+            <div class="card-icon">📅</div>
+            <div class="card-type">Scheduled Function</div>
+            <h2>Daily Price Check</h2>
+            <p>Automatically runs every day at 12:00 UTC. Searches for the cheapest return flights from Amsterdam to Bangkok with one-stop maximum and queries the Amadeus API for real-time pricing.</p>
+            <a href="https://bkk-tracker.netlify.app/.netlify/functions/ams-bkk-biz-daily" target="_blank">
+                Visit Function
+            </a>
+            <div class="card-url">
+                <strong>Endpoint:</strong><br>
+                https://bkk-tracker.netlify.app/.netlify/functions/ams-bkk-biz-daily
+            </div>
+        </div>
+
+        <!-- Test POST Function -->
+        <div class="card">
+            <div class="card-icon">🧪</div>
+            <div class="card-type">Test Function</div>
+            <h2>Test Sheets POST</h2>
+            <p>Manually trigger a test POST to Google Sheets with sample flight data. Use this to verify that the webhook integration is working correctly before the scheduler runs.</p>
+            <a href="https://bkk-tracker.netlify.app/.netlify/functions/test-sheets-post" target="_blank">
+                Run Test POST
+            </a>
+            <div class="card-url">
+                <strong>Endpoint:</strong><br>
+                https://bkk-tracker.netlify.app/.netlify/functions/test-sheets-post
+            </div>
+        </div>
+
+        <!-- Test Push Function -->
+        <div class="card">
+            <div class="card-icon">🚀</div>
+            <div class="card-type">Test Function</div>
+            <h2>Test Sheets Push</h2>
+            <p>Another manual test endpoint for pushing flight data to Google Sheets. Useful for debugging and validating the data pipeline before production use.</p>
+            <a href="https://bkk-tracker.netlify.app/.netlify/functions/test-sheets-push" target="_blank">
+                Run Test Push
+            </a>
+            <div class="card-url">
+                <strong>Endpoint:</strong><br>
+                https://bkk-tracker.netlify.app/.netlify/functions/test-sheets-push
+            </div>
+        </div>
+
+        <!-- Google Sheets Web App -->
+        <div class="card">
+            <div class="card-icon">📊</div>
+            <div class="card-type">Google Sheets</div>
+            <h2>Price Data Sheet</h2>
+            <p>Live spreadsheet tracking daily flight prices. Receives flight data via webhook POST requests from Netlify functions and displays each price point with timestamp, route details, carrier info, and flight duration metrics.</p>
+            <a href="https://docs.google.com/spreadsheets/d/1knnosX0guEgcRcTue-fzS5dHikQtbE9DH7-JEt9CAlI/edit?gid=0#gid=0" target="_blank">
+                View Data Sheet
+            </a>
+            <div class="card-url">
+                <strong>Spreadsheet ID:</strong><br>
+                1knnosX0guEgcRcTue-fzS5dHikQtbE9DH7-JEt9CAlI
+            </div>
+        </div>
+
+        <!-- Amadeus API -->
+        <div class="card">
+            <div class="card-icon">🌍</div>
+            <div class="card-type">External API</div>
+            <h2>Amadeus Flight API</h2>
+            <p>Real-time flight search API that provides live pricing and availability for flights between any two airports. Searched daily with flexible date ranges to find the best deals.</p>
+            <a href="https://developers.amadeus.com" target="_blank">
+                Amadeus Developers
+            </a>
+            <div class="card-url">
+                <strong>Service:</strong><br>
+                Flight Offers Search (v2/shopping/flight-offers)
+            </div>
+        </div>
+
+        <!-- Repository -->
+        <div class="card">
+            <div class="card-icon">💻</div>
+            <div class="card-type">Source Code</div>
+            <h2>GitHub Repository</h2>
+            <p>Complete source code for the BKK Tracker project. Includes Netlify functions, Google Apps Script webhook handler, and configuration files for the daily flight price monitoring system.</p>
+            <a href="https://github.com/Alexico1969/bkk-tracker" target="_blank">
+                View Repository
+            </a>
+            <div class="card-url">
+                <strong>GitHub URL:</strong><br>
+                github.com/Alexico1969/bkk-tracker
+            </div>
+        </div>
+    </main>
+
+    <footer>
+        <p>💎 BKK Tracker — Built with precision. Track flights to paradise. 🏝️</p>
+        <p>Last updated: December 30, 2025</p>
+    </footer>
+</body>
+</html>
