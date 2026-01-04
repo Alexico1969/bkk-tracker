@@ -99,10 +99,15 @@ function addDays(yyyy_mm_dd, delta) {
 // -------------------------
 function amadeusBaseUrl() {
   // Amadeus uses different hostnames for test vs prod
+  // FORCING TEST URL: Your keys are confirmed to be Test keys.
+  return "https://test.api.amadeus.com";
+
+  /* 
   const env = (process.env.AMADEUS_ENV || "test").toLowerCase();
   return env === "prod"
     ? "https://api.amadeus.com"
     : "https://test.api.amadeus.com";
+  */
 }
 
 async function getAmadeusToken() {
