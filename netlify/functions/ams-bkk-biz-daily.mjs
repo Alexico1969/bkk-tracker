@@ -111,10 +111,13 @@ async function getAmadeusToken() {
     return AMADEUS_TOKEN;
   }
 
-  const clientId = envOrThrow("AMADEUS_CLIENT_ID");
-  const clientSecret = envOrThrow("AMADEUS_CLIENT_SECRET");
+  const clientId = envOrThrow("AMADEUS_CLIENT_ID").trim();
+  const clientSecret = envOrThrow("AMADEUS_CLIENT_SECRET").trim();
 
-  const url = `${amadeusBaseUrl()}/v1/security/oauth2/token`;
+  const baseUrl = amadeusBaseUrl();
+  console.log(`Amadeus Init: env=${process.env.AMADEUS_ENV}, url=${baseUrl}, clientId=${clientId.substring(0, 4)}...`);
+
+  const url = `${baseUrl}/v1/security/oauth2/token`;
 
   const body = new URLSearchParams({
     grant_type: "client_credentials",
