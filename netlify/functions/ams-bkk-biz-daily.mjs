@@ -36,7 +36,7 @@ function sleep(ms) {
 }
 
 // Hard per-request timeout
-async function fetchWithTimeout(url, options = {}, timeoutMs = 7500) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -137,7 +137,7 @@ async function getAmadeusToken() {
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body,
     },
-    7500
+    30000
   );
 
   if (!res.ok) {
@@ -148,7 +148,7 @@ async function getAmadeusToken() {
   const data = await res.json();
   // Typical: { access_token, expires_in }
   AMADEUS_TOKEN = data.access_token;
-  AMADEUS_TOKEN_EXPIRES_AT_MS = Date.now() + (data.expires_in || 900) * 1000;
+  AMADEUS_TOKEN_EXPIRES_AT_MS = Date.now() + (data.expires_in || 1799) * 1000;
   return AMADEUS_TOKEN;
 }
 
@@ -185,7 +185,7 @@ async function searchOffersOnePair({
       method: "GET",
       headers: { authorization: `Bearer ${token}` },
     },
-    8000
+    45000
   );
 
   const text = await res.text().catch(() => "");
@@ -275,7 +275,7 @@ async function postToSheetsWebhook(payload) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ secret, ...payload }),
     },
-    6500
+    30000
   );
 
   const text = await res.text().catch(() => "");
